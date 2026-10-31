@@ -14,7 +14,18 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/prusa-presets.log"
 mkdir -p "$(dirname "$LOG")"
 
 log()    { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; [[ -t 2 ]] && echo "$*" >&2; return 0; }
-notify() { log "NOTIFY: $*"; command -v notify-send >/dev/null && notify-send -a PrusaSlicer -i com.prusa3d.PrusaSlicer "Preset sync" "$*" || true; }
+notify() {
+  log "NOTIFY: $*"
+  # desktop notification if a notification daemon is up; else a zenity dialog; else xmessage
+  if command -v notify-send >/dev/null && notify-send -a PrusaSlicer -i com.prusa3d.PrusaSlicer "Preset sync" "$*" 2>/dev/null; then return 0; fi
+  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+  if command -v zenity >/dev/null; then
+    (zenity --warning --title="PrusaSlicer preset sync" --width=420 --text="$*" >/dev/null 2>&1 &)
+  elif command -v xmessage >/dev/null; then
+    (xmessage -center "PrusaSlicer preset sync: $*" >/dev/null 2>&1 &)
+  fi
+  return 0
+}
 g()      { git -C "$REPO" "$@"; }
 
 prusa_version() {
