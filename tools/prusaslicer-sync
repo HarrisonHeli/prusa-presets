@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# prusaslicer-sync — pull shared presets, run PrusaSlicer, commit + push on exit.
+#
+#   prusaslicer-sync [files/urls...]   launch wrapper (what the desktop entry runs)
+#   prusaslicer-sync --sync            pull/commit/push only, no launch
+#   prusaslicer-sync --status          show repo state
+#
+# Env: PRESETS_REPO (default: dir above this script), PRUSA_CMD (override launcher)
+set -uo pipefail
+
+REPO="${PRESETS_REPO:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
+HOST="$(hostname -s)"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/prusa-presets.log"
+mkdir -p "$(dirname "$LOG")"
+
+log()    { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; [[ -t 2 ]] && echo "$*" >&2; return 0; }
+notify() { log "NOTIFY: $*"; command -v notify-send >/dev/null && notify-send -a PrusaSlicer -i com.prusa3d.PrusaSlicer "Preset sync" "$*" || true; }
+g()      { git -C "$REPO" "$@"; }
+
+prusa_version() {
+  if [[ -n "${PRUSA_CMD:-}" ]]; then echo "custom"
+  elif flatpak info com.prusa3d.PrusaSlicer >/dev/null 2>&1; then
+    flatpak info com.prusa3d.PrusaSlicer | awk -F': *' '/Version/{print $2; exit}'
+  elif command -v prusa-slicer >/dev/null; then prusa-slicer --help 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' || echo unknown
+  else echo none; fi
+}
+
+commit_local() {
+  # record this machine's PrusaSlicer version so mismatches are visible
+  mkdir -p "$REPO/.machines"
+  local v; v="$(prusa_version)"
+  [[ "$(cat "$REPO/.machines/$HOST" 2>/dev/null)" == "$v" ]] || echo "$v" >"$REPO/.machines/$HOST"
+  g add -A
+  if ! g diff --cached --quiet; then
+    local files; files="$(g diff --cached --name-only | grep -v '^\.machines/' | sed 's#\.ini$##' | paste -sd, - | cut -c1-120)"
+    g commit -q -m "${files:-machine info} [$HOST]" && log "committed: ${files:-machine info}"
+  fi
+}
+
+check_versions() {
+  local mine; mine="$(prusa_version)"; local other
+  for f in "$REPO"/.machines/*; do
+    [[ -f "$f" && "$(basename "$f")" != "$HOST" ]] || continue
+    other="$(cat "$f")"
+    if [[ "$other" != "$mine" && "$other" != custom && "$mine" != custom ]]; then
+      notify "Version mismatch: $HOST has $mine, $(basename "$f") has $other. Newer versions may write settings older ones ignore."
+      return
+    fi
+  done
+}
+
+sync_repo() {   # $1 = pull|push|both
+  [[ -d "$REPO/.git" ]] || { notify "No presets repo at $REPO"; return 1; }
+  if [[ -e "$REPO/.git/rebase-merge" || -e "$REPO/.git/rebase-apply" ]]; then
+    notify "Presets repo has an unresolved conflict — fix it in $REPO (git status). Not syncing."; return 1
+  fi
+  commit_local
+  g remote get-url origin >/dev/null 2>&1 || { log "no remote configured; local commits only"; return 0; }
+  if ! timeout 20 git -C "$REPO" fetch -q origin 2>>"$LOG"; then
+    log "offline/fetch failed — using local presets"; return 0
+  fi
+  local br; br="$(g symbolic-ref --short HEAD)"
+  if g rev-parse -q --verify "origin/$br" >/dev/null; then
+    if ! g rebase -q "origin/$br" >>"$LOG" 2>&1; then
+      local cf; cf="$(g diff --name-only --diff-filter=U | paste -sd, -)"
+      g rebase --abort
+      notify "Conflict in: $cf. Another machine changed the same setting. Your version is kept locally and NOT pushed. Resolve: cd $REPO && git pull --rebase"
+      return 1
+    fi
+  fi
+  if [[ "$1" != pull ]] && [[ -n "$(g log --oneline "origin/$br..HEAD" 2>/dev/null || echo new)" ]]; then
+    if timeout 30 git -C "$REPO" push -q origin "$br" 2>>"$LOG"; then log "pushed"
+    else notify "Push failed — changes are committed locally and will push next time."; fi
+  fi
+  return 0
+}
+
+launch() {
+  if [[ -n "${PRUSA_CMD:-}" ]]; then $PRUSA_CMD "$@"
+  elif flatpak info com.prusa3d.PrusaSlicer >/dev/null 2>&1; then
+    flatpak run --branch=stable --command=entrypoint --file-forwarding com.prusa3d.PrusaSlicer \
+      --single-instance-on-url @@u "$@" @@
+  elif command -v prusa-slicer >/dev/null; then prusa-slicer --single-instance-on-url "$@"
+  else notify "PrusaSlicer not found"; return 127; fi
+}
+
+case "${1:-}" in
+  --sync)   sync_repo both; exit ;;
+  --status) g status -sb; echo; g log --oneline -10; echo; echo "machines:"; grep -H . "$REPO"/.machines/* 2>/dev/null; exit ;;
+esac
+
+# Already running? Just hand the file/URL to the existing instance — the
+# instance that was launched through this wrapper owns the sync on exit.
+if pgrep -f '[/]prusa-slicer' >/dev/null; then launch "$@"; exit; fi
+
+sync_repo pull
+check_versions
+launch "$@"; rc=$?
+# --single-instance hands off and returns immediately if another instance
+# appeared meanwhile; wait until no PrusaSlicer is left before pushing.
+while pgrep -f '[/]prusa-slicer' >/dev/null; do sleep 3; done
+sync_repo both
+exit $rc
